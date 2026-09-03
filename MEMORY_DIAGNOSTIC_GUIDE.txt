@@ -1,0 +1,178 @@
+import java.util.*;
+
+/**
+ * DIAGNOSTIC WRAPPER - Detects memory bottlenecks
+ * Add this to ProdFileDelimiterUI.java performFileGeneration() method
+ * to identify which stage consumes memory
+ */
+
+// ADD AT LINE 459 (beginning of performFileGeneration method):
+
+long memStart = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();
+appendLog("[MEMORY] Initial heap usage: " + (memStart / 1024 / 1024) + " MB");
+
+try {
+    // ... existing code ...
+    
+    // AFTER QUEUE INITIALIZATION (line ~524):
+    long memAfterQueues = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();
+    appendLog("[MEMORY] After queue init: " + ((memAfterQueues - memStart) / 1024 / 1024) + " MB increase");
+    
+    // AFTER EXCEL GENERATOR INIT (line ~536):
+    long memAfterExcel = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();
+    appendLog("[MEMORY] After Excel init: " + ((memAfterExcel - memAfterQueues) / 1024 / 1024) + " MB increase");
+    
+    // IN MAPPING THREAD LAMBDA (line ~620, inside ColumnMapper.mapRecordsToColumns call):
+    long memBeforeMap = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();
+    appendLog("[MEMORY-" + threadNum + "] Before mapping batch: " + (memBeforeMap / 1024 / 1024) + " MB");
+    
+    List<Map<String, String>> mappedRecords = ColumnMapper
+            .mapRecordsToColumns(batch.getRecords(), excelHeadersCapture, jsonFieldHeadingsCapture);
+    
+    long memAfterMap = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();
+    appendLog("[MEMORY-" + threadNum + "] After mapping: " + ((memAfterMap - memBeforeMap) / 1024 / 1024) + " MB increase");
+    
+    // AFTER EXCEL WRITE (line ~627):
+    long memAfterWrite = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();
+    appendLog("[MEMORY-" + threadNum + "] After Excel write: " + ((memAfterWrite - memAfterMap) / 1024 / 1024) + " MB change");
+    
+    mappedRecords.clear();
+    System.gc();
+    
+    long memAfterGC = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();
+    appendLog("[MEMORY-" + threadNum + "] After GC: " + ((memAfterGC - memAfterWrite) / 1024 / 1024) + " MB freed");
+    
+} catch (Exception e) {
+    long memError = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();
+    appendLog("[MEMORY] ERROR heap usage: " + (memError / 1024 / 1024) + " MB");
+    throw e;
+}
+
+// IN FINALLY BLOCK (line ~695):
+long memEnd = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();
+appendLog("[MEMORY] Final heap usage: " + (memEnd / 1024 / 1024) + " MB");
+appendLog("[MEMORY] Peak increase from start: " + ((memEnd - memStart) / 1024 / 1024) + " MB");
+
+
+================================================================================
+WHAT TO LOOK FOR IN THE OUTPUT:
+================================================================================
+
+Pattern 1 - Memory grows continuously (NEVER decreases):
+  [MEMORY] Initial: 50 MB
+  [MEMORY] After queues: 150 MB (+100)
+  [MEMORY] After Excel: 250 MB (+100)
+  [MEMORY-T0] Batch 1: 280 MB (+30)  ← Should see this
+  [MEMORY-T0] After map: 350 MB (+70)  ← PROBLEM: Growing!
+  [MEMORY-T0] After write: 400 MB (+50)  ← Should see oscillation, not growth
+  [MEMORY-T0] After GC: 300 MB (-100)  ← Good, GC is working
+  Result: ❌ Queue is accumulating faster than consuming
+  Fix: Reduce BATCH_SIZE to 100-150 or increase threads to 12-16
+
+Pattern 2 - Memory spikes after mapping:
+  [MEMORY-T0] Before mapping batch: 200 MB
+  [MEMORY-T0] After mapping: 350 MB (+150)  ← PROBLEM: ColumnMapper doubles memory!
+  [MEMORY-T0] After Excel write: 250 MB (-100)  ← Good
+  [MEMORY-T0] After GC: 200 MB (-50)  ← Good
+  Result: ❌ ColumnMapper creating too many copies
+  Fix: Optimize ColumnMapper to stream instead of ArrayList
+
+Pattern 3 - Memory doesn't drop after GC:
+  [MEMORY-T0] After write: 400 MB
+  [MEMORY-T0] After GC: 380 MB (-20)  ← PROBLEM: GC not effective!
+  Result: ❌ True memory leak or fragmentation
+  Fix: Check ThreadSafeExcelGenerator.writeBatch() for row accumulation
+
+Pattern 4 - Excel write consumes unexpected memory:
+  [MEMORY-T0] After map: 250 MB
+  [MEMORY-T0] After Excel write: 500 MB (+250)  ← PROBLEM: POI buffering!
+  Result: ❌ Apache POI caching rows in memory
+  Fix: Force flush or use streaming mode
+
+EXPECTED GOOD PATTERN:
+  [MEMORY] Initial: 50 MB
+  [MEMORY] After queues: 60 MB (+10)
+  [MEMORY] After Excel: 70 MB (+10)
+  [MEMORY-T0] Batch 1: 100 MB (+30)  ← Batch loaded
+  [MEMORY-T0] After map: 130 MB (+30)  ← Mapped copy
+  [MEMORY-T0] After write: 90 MB (-40)  ← Released after write
+  [MEMORY-T0] After GC: 70 MB (-20)  ← GC cleaned up
+  [MEMORY-T1] Batch 2: 100 MB (+30)  ← Same pattern repeats
+  ...
+  [MEMORY] Peak increase: 300 MB (controlled!)
+  Result: ✅ Good memory management
+
+
+================================================================================
+HOW TO RUN WITH DIAGNOSTICS:
+================================================================================
+
+1. ADD the diagnostic code above to ProdFileDelimiterUI.java
+
+2. Recompile:
+   $ mvn clean compile -DskipTests
+
+3. Run with diagnostic output:
+   $ java -Xmx2048m -cp target/classes;target/lib/* com.tmg.ui.EnrollMainApplicationUI
+   
+4. Process the production file with 12,547 records
+
+5. Collect ALL console output containing [MEMORY] and [MEMORY-T*]
+
+6. Share the output with these questions:
+   - Does memory grow continuously or stay bounded?
+   - When does OutOfMemoryError occur (which batch)?
+   - What's the peak memory before crash?
+   - Which thread reports the highest memory usage?
+
+
+================================================================================
+IF YOU CAN'T MODIFY CODE, USE JVM MONITORING:
+================================================================================
+
+In separate terminal, start JVisualVM:
+  $ jvisualvm
+
+Steps:
+  1. Run your application: java -Xmx2048m -cp ... Application
+  2. Open jvisualvm
+  3. Select your Java application from left panel
+  4. Click "Monitor" tab
+  5. Watch "Heap" graph in real-time
+  6. Screenshot the graph when OutOfMemoryError occurs
+
+What to look for:
+  - Sawtooth pattern (good): Memory rises then drops sharply
+  - Steady climb (bad): Memory keeps rising without drops
+  - Vertical spike to red (crash): OutOfMemoryError imminent
+
+
+================================================================================
+CRITICAL QUESTIONS FOR DIAGNOSIS:
+================================================================================
+
+1. When does the OutOfMemoryError occur?
+   - During parsing (reading file)?
+   - During mapping (transforming records)?
+   - During Excel writing (saving to file)?
+   - After all complete (during cleanup)?
+
+2. What batch number causes it?
+   - If it's batch 1-5: Problem is initialization
+   - If it's batch 10-20: Problem is queue buildup
+   - If it's batch 50+ (near end): Problem is cumulative
+
+3. How large is your production file?
+   - Expected: 200 MB with 12,547 records
+   - If larger: Need even smaller batch size
+
+4. How many records does your file ACTUALLY have?
+   - We assumed 12,547
+   - If 50,000+ records: Batch size needs to be 50-100
+
+5. Are you running other applications?
+   - Chrome, IDE, Slack consume memory
+   - They reduce available heap
+
+
+================================================================================
